@@ -1,0 +1,28 @@
+name: lucid-alerts
+on:
+  schedule:
+    - cron: "*/5 7-21 * * 1-5"   # elke 5 min, ma-vr, 07:00-21:55 UTC (dekt 09:00-21:30 Amsterdam, zomer- en wintertijd)
+  workflow_dispatch: {}
+concurrency:
+  group: lucid-alerts
+  cancel-in-progress: false
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas numpy
+      - name: Herstel gemelde signalen
+        uses: actions/cache@v4
+        with:
+          path: alerts_sent.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+      - name: Controleer signalen
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python lucid_alerts.py --topic "$NTFY_TOPIC" --once
