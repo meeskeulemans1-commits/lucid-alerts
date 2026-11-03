@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+lucid_alerts.py - stuurt een melding naar je telefoon (via de gratis ntfy-app) zodra een van de 3 strategieen een signaal geeft.
+
+Strategieen (5-minuten bars, 1 micro-contract, stop 1,5x ATR, doel 1,5x het risico):
+  1. MNQ  Turtle soup               (mislukte uitbraak van het 20-bar hoog/laag)
+  2. MNQ  VWAP-terugkeer            (prijs 2 ATR van het dag-VWAP)
+  3. MGC  Break & retest weekniveau (uitbraak van hoog/laag van vorige week + terugtest)
+
+Koersen komen van Yahoo Finance (NQ=F en GC=F, enkele minuten vertraagd). Dit is een HYPOTHESE uit een backtest op CFD-data,
+geen advies. Het script plaatst GEEN orders; jij zet de order zelf met de stop en het doel uit de melding.
+
+Gebruik:
+    pip install pandas numpy
+    python3 lucid_alerts.py --topic JOUW-GEHEIME-NAAM          # live draaien
+    python3 lucid_alerts.py --topic JOUW-GEHEIME-NAAM --test   # stuurt een testmelding en toont recente signalen
+Stel in de ntfy-app (iOS/Android) een abonnement in op dezelfde naam.
+"""
+import argparse, json, os, sys, time, urllib.request, urllib.error
+import numpy as np, pandas as pd
+
+TZ = "Europe/Amsterdam"
+E0, E1, FLAT = 540, 1290, 1350          # entry 09:00-21:30, alles dicht 22:30 (minuten sinds middernacht, Amsterdam)
+STOP_ATR, RR, MAX_TRADES = 1.5, 1.5, 3
+
+# Hoog-impact nieuws (tijden New York); in de ~45 minuten rond deze momenten komt er een waarschuwing en geen signaal.
+NEWS = [("2026-11-06", 8, 30), ("2026-11-10", 8, 30), ("2026-11-25", 8, 30), ("2026-12-04", 8, 30), ("2026-12-09", 14, 0),
+        ("2026-12-10", 8, 30), ("2026-12-23", 8, 30), ("2027-01-08", 8, 30), ("2027-01-13", 8, 30), ("2027-01-27", 14, 0)]
+
+MARKETS = {"MNQ": dict(symbol="NQ=F", pointval=2.0), "MGC": dict(symbol="GC=F", pointval=10.0)}
+
+# ---------- indicatoren
+def rma(s, n): return s.ewm(alpha=1 / n, adjust=False).mean()
+def atr(b, n=14):
+    tr = pd.concat([b.high - b.low, (b.high - b.close.shift()).abs(), (b.low - b.close.shift()).abs()], axis=1).max(axis=1)
+    return rma(tr, n)
+def ev(cond): return cond & ~cond.shift(fill_value=False)
+def sg(long, short):
+    s = pd.Series(0, index=long.index)
+    s[long.fillna(False)] = 1; s[short.fillna(False)] = -1
+    return s
+
+def prep(df):
+    b = df.resample("5min", label="left", closed="left").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+    b["date"] = b.index.date
+    b["t"] = b.index.hour * 60 + b.index.minute
+    b["atr"] = atr(b)
+    hlc3 = (b.high + b.low + b.close) / 3
+    b["vwap"] = hlc3.groupby(b.date).transform(lambda s: s.expanding().mean())
+    return b
+
+# ---------- strategieen (identiek aan de backtest)
+def turtle_soup(b):
+    lo, hi = b.low.rolling(20).min().shift(), b.high.rolling(20).max().shift()
+    return sg(ev((b.low < lo) & (b.close > lo)), ev((b.high > hi) & (b.close < hi)))
+
+def vwap_reversion(b):
+    d = (b.close - b.vwap) / b.atr
+    return sg(ev(d < -2), ev(d > 2))
+
+def levels_prev_week(b):
+    iso = b.index.isocalendar()
+    wk = (iso.year.astype(int) * 100 + iso.week.astype(int)).values
+    hi = b.groupby(wk).high.max(); lo = b.groupby(wk).low.min()
+    order = list(hi.index)
+    prev = {order[i]: (hi.iloc[i - 1], lo.iloc[i - 1]) for i in range(1, len(order))}
+    H = np.array([prev.get(w, (np.nan, np.nan))[0] for w in wk]); L = np.array([prev.get(w, (np.nan, np.nan))[1] for w in wk])
+    return H, L
+
+def break_retest(b, hi_lvl, lo_lvl, window=12, tol=0.15, fail=0.5):
+    c, h, l, a, t = (b[k].values for k in ("close", "high", "low", "atr", "t")); d = b["date"].values
+    hi, lo = np.asarray(hi_lvl, float), np.asarray(lo_lvl, float)
+    n = len(b); sig = np.zeros(n, int); act = None
+    for i in range(1, n):
+        if act is not None:
+            side, lvl, i0, d0 = act
+            if d[i] != d0 or i - i0 > window: act = None
+            elif side == 1:
+                if c[i] < lvl - fail * a[i]: act = None
+                elif l[i] <= lvl + tol * a[i] and c[i] > lvl:
+                    if E0 <= t[i] < E1: sig[i] = 1
+                    act = None
+            else:
+                if c[i] > lvl + fail * a[i]: act = None
+                elif h[i] >= lvl - tol * a[i] and c[i] < lvl:
+                    if E0 <= t[i] < E1: sig[i] = -1
+                    act = None
+        if act is None and not np.isnan(a[i]):
+            if not np.isnan(hi[i]) and c[i] > hi[i] and c[i - 1] <= hi[i]: act = (1, hi[i], i, d[i])
+            elif not np.isnan(lo[i]) and c[i] < lo[i] and c[i - 1] >= lo[i]: act = (-1, lo[i], i, d[i])
+    return pd.Series(sig, index=b.index)
+
+STRATS = [("MNQ Turtle soup", "MNQ", turtle_soup),
+          ("MNQ VWAP-terugkeer", "MNQ", vwap_reversion),
+          ("MGC Break&retest vorige week", "MGC", lambda b: break_retest(b, *levels_prev_week(b)))]
+
+# ---------- data
+def fetch(symbol):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol.replace('=', '%3D')}?interval=5m&range=1mo"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        j = json.load(r)
+    res = j["chart"]["result"][0]; q = res["indicators"]["quote"][0]
+    df = pd.DataFrame({"open": q["open"], "high": q["high"], "low": q["low"], "close": q["close"]},
+                      index=pd.to_datetime(res["timestamp"], unit="s", utc=True).tz_convert(TZ)).dropna()
+    # laatste (onvolledige) bar weglaten
+    now = pd.Timestamp.now(tz=TZ)
+    return df[df.index + pd.Timedelta(minutes=5) <= now + pd.Timedelta(seconds=5)]
+
+def near_news(ts):
+    for d, h, m in NEWS:
+        t = pd.Timestamp(f"{d} {h:02d}:{m:02d}", tz="America/New_York").tz_convert(TZ)
+        if t - pd.Timedelta(minutes=30) <= ts <= t + pd.Timedelta(minutes=60): return True
+    return False
+
+def alert_text(name, mkt, side, entry, a):
+    pv = MARKETS[mkt]["pointval"]; sd = STOP_ATR * a
+    stop, tgt = entry - side * sd, entry + side * sd * RR
+    return (f"{'LONG' if side == 1 else 'SHORT'} {name}",
+            f"1 {mkt}-contract | entry ca. {entry:.2f} (marktorder bij open volgende bar) | stop {stop:.2f} | doel {tgt:.2f} | "
+            f"risico ca. ${sd * pv:.0f} | winst ca. ${sd * pv * RR:.0f} | alles dicht 22:30")
+
+def push(topic, title, msg, priority="high"):
+    req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=msg.encode("utf-8"),
+                                 headers={"Title": title.encode("ascii", "ignore").decode(), "Priority": priority, "Tags": "chart_with_upwards_trend"})
+    urllib.request.urlopen(req, timeout=20).read()
+
+def scan(sent, topic, dry=False, replay_bars=0):
+    found = []
+    cache = {}
+    for name, mkt, fn in STRATS:
+        try:
+            if mkt not in cache: cache[mkt] = prep(fetch(MARKETS[mkt]["symbol"]))
+        except (urllib.error.URLError, KeyError, TimeoutError, ValueError) as e:
+            print(f"[{time.strftime('%H:%M:%S')}] data {mkt} mislukt: {e}"); continue
+        b = cache[mkt]; sig = fn(b)
+        idx = range(len(b) - max(1, replay_bars), len(b))
+        for i in idx:
+            s = int(sig.iloc[i]); ts = b.index[i]
+            if s == 0 or not (E0 <= b.t.iloc[i] < E1) or np.isnan(b.atr.iloc[i]): continue
+            key = f"{name}|{ts.isoformat()}"
+            day_key = f"{name}|{b.date.iloc[i]}"
+            if replay_bars == 0:
+                if key in sent: continue
+                if (pd.Timestamp.now(tz=TZ) - ts) > pd.Timedelta(minutes=25): continue   # te oud, niet meer instappen
+                if sent.get(day_key, 0) >= MAX_TRADES: continue
+                if near_news(ts): sent[key] = 1; continue
+            title, msg = alert_text(name, mkt, s, b.close.iloc[i], b.atr.iloc[i])
+            found.append((ts, title, msg))
+            if replay_bars == 0:
+                sent[key] = 1; sent[day_key] = sent.get(day_key, 0) + 1
+                if not dry: push(topic, title, msg)
+    return found
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--topic", required=True, help="geheime ntfy-kanaalnaam, kies zelf een lange willekeurige naam")
+    ap.add_argument("--test", action="store_true", help="stuur een testmelding en toon de signalen van de laatste ~2 dagen")
+    ap.add_argument("--once", action="store_true", help="een keer controleren en stoppen (voor GitHub Actions)")
+    ap.add_argument("--every", type=int, default=60, help="seconden tussen controles (standaard 60)")
+    a = ap.parse_args()
+    state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alerts_sent.json")
+    sent = json.load(open(state_file)) if os.path.exists(state_file) else {}
+    if a.test:
+        push(a.topic, "Test lucid_alerts", "Als je dit leest, werken de meldingen.", "default")
+        print("Testmelding gestuurd. Signalen in de laatste 2 dagen (alleen ter controle, geen meldingen):")
+        for ts, title, msg in sorted(scan(sent, a.topic, dry=True, replay_bars=576)):
+            print(" ", ts.strftime("%a %d-%m %H:%M"), title, "|", msg)
+        return
+    if a.once:
+        for ts, title, msg in scan(sent, a.topic):
+            print(f"{title} | {msg}")
+        json.dump(sent, open(state_file, "w"))
+        return
+    print("lucid_alerts draait. Stoppen met Ctrl+C. Laat dit venster open en je computer aan.")
+    while True:
+        for ts, title, msg in scan(sent, a.topic):
+            print(f"[{time.strftime('%H:%M:%S')}] {title} | {msg}")
+        json.dump(sent, open(state_file, "w"))
+        time.sleep(a.every)
+
+if __name__ == "__main__":
+    main()
