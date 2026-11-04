@@ -126,7 +126,11 @@ class Capital:
     def _req(s, method, path, body=None):
         h = dict(s.hdr or {"X-CAP-API-KEY": s.key}); h["Content-Type"] = "application/json"
         req = urllib.request.Request(s.base + path, data=json.dumps(body).encode() if body else None, headers=h, method=method)
-        return urllib.request.urlopen(req, timeout=20)
+        try:
+            return urllib.request.urlopen(req, timeout=20)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")[:300]
+            raise RuntimeError(f"HTTP {e.code} op {method} {path.split('?')[0]}: {body}") from None
     def login(s):
         s.hdr = None
         r = s._req("POST", "/session", {"identifier": s.user, "password": s.pw, "encryptedPassword": False})
@@ -138,8 +142,8 @@ class Capital:
                 if s.hdr is None: s.login()
                 j = json.load(s._req("GET", f"/prices/{epic}?resolution={res}&{qs}"))
                 break
-            except urllib.error.HTTPError as e:
-                if e.code == 401 and attempt == 0: s.hdr = None; continue
+            except RuntimeError as e:
+                if "HTTP 401" in str(e) and attempt == 0 and s.hdr is not None: s.hdr = None; continue
                 raise
         rows = []
         for c in j["prices"]:
@@ -150,7 +154,7 @@ class Capital:
         return d
     def fetch(s, epic):
         if epic not in s.hist:                      # eenmalig ~30 dagen 5-min historie (voor weekniveaus)
-            end = pd.Timestamp.utcnow().tz_localize(None); parts = []
+            end = pd.Timestamp.now("UTC").tz_localize(None); parts = []
             for i in range(10):
                 to = end - pd.Timedelta(days=3 * i); fr = to - pd.Timedelta(days=3)
                 parts.append(s._prices(epic, "MINUTE_5", max=1000, **{"from": fr.strftime("%Y-%m-%dT%H:%M:%S"), "to": to.strftime("%Y-%m-%dT%H:%M:%S")}))
@@ -232,6 +236,7 @@ def scan(sent, topic, dry=False, replay_bars=0):
     return found
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser()
     ap.add_argument("--topic", required=True, help="geheime ntfy-kanaalnaam, kies zelf een lange willekeurige naam")
     ap.add_argument("--test", action="store_true", help="stuur een testmelding en toon de signalen van de laatste ~2 dagen")
