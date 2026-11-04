@@ -120,8 +120,8 @@ def fetch_yahoo(symbol):
 class Capital:
     base = "https://demo-api-capital.backend-capital.com/api/v1"
     def __init__(s):
-        s.key, s.user, s.pw = os.environ.get("CAPITAL_API_KEY"), os.environ.get("CAPITAL_EMAIL"), os.environ.get("CAPITAL_PASSWORD")
-        s.hdr = None; s.hist = {}
+        s.key, s.user, s.pw = [(os.environ.get(k) or "").strip() for k in ("CAPITAL_API_KEY", "CAPITAL_EMAIL", "CAPITAL_PASSWORD")]
+        s.hdr = None; s.hist = {}; s.blocked_until = 0
     def enabled(s): return bool(s.key and s.user and s.pw)
     def _req(s, method, path, body=None):
         h = dict(s.hdr or {"X-CAP-API-KEY": s.key}); h["Content-Type"] = "application/json"
@@ -133,8 +133,11 @@ class Capital:
             raise RuntimeError(f"HTTP {e.code} op {method} {path.split('?')[0]}: {body}") from None
     def login(s):
         s.hdr = None
+        if time.time() < s.blocked_until: raise RuntimeError("inloggen gepauzeerd na eerdere fout (10 min)")
+        s.blocked_until = time.time() + 600      # alleen vrijgeven als inloggen lukt; voorkomt 429 en blokkade
         r = s._req("POST", "/session", {"identifier": s.user, "password": s.pw, "encryptedPassword": False})
         s.hdr = {"X-CAP-API-KEY": s.key, "CST": r.headers["CST"], "X-SECURITY-TOKEN": r.headers["X-SECURITY-TOKEN"]}
+        s.blocked_until = 0
     def _prices(s, epic, res, **q):
         qs = "&".join(f"{k}={v}" for k, v in q.items())
         for attempt in (0, 1):
