@@ -1,7 +1,7 @@
 name: lucid-alerts
 on:
   schedule:
-    - cron: "*/5 7-21 * * 1-5"   # elke 5 min, ma-vr, 07:00-21:55 UTC (dekt 09:00-21:30 Amsterdam, zomer- en wintertijd)
+    - cron: "5,35 7-21 * * 1-5"   # GitHub start soms te laat; elke run blijft ~55 min actief en controleert elke 30 s
   workflow_dispatch: {}
 concurrency:
   group: lucid-alerts
@@ -9,7 +9,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 58
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,7 +22,10 @@ jobs:
           path: alerts_sent.json
           key: state-${{ github.run_id }}
           restore-keys: state-
-      - name: Controleer signalen
+      - name: Controleer signalen (loop)
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python lucid_alerts.py --topic "$NTFY_TOPIC" --once
+          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_EMAIL: ${{ secrets.CAPITAL_EMAIL }}
+          CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
+        run: python lucid_alerts.py --topic "$NTFY_TOPIC" --loop 3200 --every 30
