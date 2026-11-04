@@ -188,8 +188,9 @@ def alert_text(name, mkt, side, entry, a):
     pv = MARKETS[mkt]["pointval"]; sd = STOP_ATR * a
     stop, tgt = entry - side * sd, entry + side * sd * RR
     return (f"{'LONG' if side == 1 else 'SHORT'} {name}",
-            f"1 {mkt}-contract | entry ca. {entry:.2f} (marktorder bij open volgende bar) | stop {stop:.2f} | doel {tgt:.2f} | "
-            f"risico ca. ${sd * pv:.0f} | winst ca. ${sd * pv * RR:.0f} | alles dicht 22:30")
+            f"1 {mkt}-contract | marktorder | STOP {sd:.1f} punten {'onder' if side == 1 else 'boven'} je instap | "
+            f"DOEL {sd * RR:.1f} punten {'boven' if side == 1 else 'onder'} je instap | risico ca. ${sd * pv:.0f} | winst ca. ${sd * pv * RR:.0f} | "
+            f"(koers hier: entry ca. {entry:.2f}, stop {stop:.2f}, doel {tgt:.2f}; jouw platform wijkt een paar punten af) | alles dicht 22:30")
 
 def push(topic, title, msg, priority="high"):
     req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=msg.encode("utf-8"),
