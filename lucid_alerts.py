@@ -7,7 +7,7 @@ Strategieen (5-minuten bars, 1 micro-contract, stop 1,5x ATR, doel 1,5x het risi
   2. MNQ  VWAP-terugkeer            (prijs 2 ATR van het dag-VWAP)
   3. MGC  Break & retest weekniveau (uitbraak van hoog/laag van vorige week + terugtest)
 
-Koersen komen van Yahoo Finance (NQ=F en GC=F, enkele minuten vertraagd). Dit is een HYPOTHESE uit een backtest op CFD-data,
+Koersen komen van Yahoo Finance (NQ=F en GC=F, 1-minuutdata, enkele minuten vertraagd). Naast de definitieve melding stuurt het script een VOORSIGNAAL zodra de lopende bar zo zou sluiten dat er een signaal komt. Dit is een HYPOTHESE uit een backtest op CFD-data,
 geen advies. Het script plaatst GEEN orders; jij zet de order zelf met de stop en het doel uit de melding.
 
 Gebruik:
@@ -27,7 +27,7 @@ STOP_ATR, RR, MAX_TRADES = 1.5, 1.5, 3
 NEWS = [("2026-11-06", 8, 30), ("2026-11-10", 8, 30), ("2026-11-25", 8, 30), ("2026-12-04", 8, 30), ("2026-12-09", 14, 0),
         ("2026-12-10", 8, 30), ("2026-12-23", 8, 30), ("2027-01-08", 8, 30), ("2027-01-13", 8, 30), ("2027-01-27", 14, 0)]
 
-MARKETS = {"MNQ": dict(symbol="NQ=F", pointval=2.0), "MGC": dict(symbol="GC=F", pointval=10.0)}
+MARKETS = {"MNQ": dict(symbol="NQ=F", epic="US100", pointval=2.0), "MGC": dict(symbol="GC=F", epic="GOLD", pointval=10.0)}
 
 # ---------- indicatoren
 def rma(s, n): return s.ewm(alpha=1 / n, adjust=False).mean()
@@ -95,17 +95,81 @@ STRATS = [("MNQ Turtle soup", "MNQ", turtle_soup),
           ("MGC Break&retest vorige week", "MGC", lambda b: break_retest(b, *levels_prev_week(b)))]
 
 # ---------- data
-def fetch(symbol):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol.replace('=', '%3D')}?interval=5m&range=1mo"
+def _yahoo(symbol, interval, rng):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol.replace('=', '%3D')}?interval={interval}&range={rng}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=20) as r:
         j = json.load(r)
     res = j["chart"]["result"][0]; q = res["indicators"]["quote"][0]
-    df = pd.DataFrame({"open": q["open"], "high": q["high"], "low": q["low"], "close": q["close"]},
-                      index=pd.to_datetime(res["timestamp"], unit="s", utc=True).tz_convert(TZ)).dropna()
-    # laatste (onvolledige) bar weglaten
-    now = pd.Timestamp.now(tz=TZ)
-    return df[df.index + pd.Timedelta(minutes=5) <= now + pd.Timedelta(seconds=5)]
+    return pd.DataFrame({"open": q["open"], "high": q["high"], "low": q["low"], "close": q["close"]},
+                        index=pd.to_datetime(res["timestamp"], unit="s", utc=True).tz_convert(TZ)).dropna()
+
+def fetch_yahoo(symbol):
+    """5-min historie (1 maand, nodig voor weekniveaus) + 1-min data voor de laatste dagen (minder vertraging).
+    De laatste, nog niet afgesloten 5-min bar blijft erin; scan() behandelt die apart."""
+    d5 = _yahoo(symbol, "5m", "1mo")
+    try:
+        d1 = _yahoo(symbol, "1m", "5d")
+        d5 = pd.concat([d5[d5.index < d1.index[0]], d1])
+    except Exception as e:
+        print(f"[{time.strftime('%H:%M:%S')}] 1-min data niet beschikbaar ({e}); gebruik 5-min")
+    return d5
+
+
+# ---------- Capital.com (gratis demo-account, realtime CFD-koersen); alleen actief als de 3 CAPITAL_* variabelen gezet zijn
+class Capital:
+    base = "https://demo-api-capital.backend-capital.com/api/v1"
+    def __init__(s):
+        s.key, s.user, s.pw = os.environ.get("CAPITAL_API_KEY"), os.environ.get("CAPITAL_EMAIL"), os.environ.get("CAPITAL_PASSWORD")
+        s.hdr = None; s.hist = {}
+    def enabled(s): return bool(s.key and s.user and s.pw)
+    def _req(s, method, path, body=None):
+        h = dict(s.hdr or {"X-CAP-API-KEY": s.key}); h["Content-Type"] = "application/json"
+        req = urllib.request.Request(s.base + path, data=json.dumps(body).encode() if body else None, headers=h, method=method)
+        return urllib.request.urlopen(req, timeout=20)
+    def login(s):
+        s.hdr = None
+        r = s._req("POST", "/session", {"identifier": s.user, "password": s.pw, "encryptedPassword": False})
+        s.hdr = {"X-CAP-API-KEY": s.key, "CST": r.headers["CST"], "X-SECURITY-TOKEN": r.headers["X-SECURITY-TOKEN"]}
+    def _prices(s, epic, res, **q):
+        qs = "&".join(f"{k}={v}" for k, v in q.items())
+        for attempt in (0, 1):
+            try:
+                if s.hdr is None: s.login()
+                j = json.load(s._req("GET", f"/prices/{epic}?resolution={res}&{qs}"))
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 0: s.hdr = None; continue
+                raise
+        rows = []
+        for c in j["prices"]:
+            mid = lambda k: (c[k]["bid"] + c[k]["ask"]) / 2
+            rows.append((c["snapshotTimeUTC"], mid("openPrice"), mid("highPrice"), mid("lowPrice"), mid("closePrice")))
+        d = pd.DataFrame(rows, columns=["t", "open", "high", "low", "close"])
+        d.index = pd.to_datetime(d.pop("t"), utc=True).dt.tz_convert(TZ)
+        return d
+    def fetch(s, epic):
+        if epic not in s.hist:                      # eenmalig ~30 dagen 5-min historie (voor weekniveaus)
+            end = pd.Timestamp.utcnow().tz_localize(None); parts = []
+            for i in range(10):
+                to = end - pd.Timedelta(days=3 * i); fr = to - pd.Timedelta(days=3)
+                parts.append(s._prices(epic, "MINUTE_5", max=1000, **{"from": fr.strftime("%Y-%m-%dT%H:%M:%S"), "to": to.strftime("%Y-%m-%dT%H:%M:%S")}))
+            h = pd.concat(parts); s.hist[epic] = h[~h.index.duplicated()].sort_index()
+        h = s.hist[epic]
+        m1 = s._prices(epic, "MINUTE", max=60)       # laatste uur op 1 minuut, samengesteld tot 5-min bars (incl. lopende bar)
+        r = m1.resample("5min").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+        h = pd.concat([h[h.index < r.index[0]], r]); s.hist[epic] = h[h.index >= h.index[-1] - pd.Timedelta(days=32)]
+        return s.hist[epic]
+CAP = Capital()
+
+def fetch(symbol):
+    if CAP.enabled():
+        try:
+            epic = next(m["epic"] for m in MARKETS.values() if m["symbol"] == symbol)
+            return CAP.fetch(epic)
+        except Exception as e:
+            print(f"[{time.strftime('%H:%M:%S')}] Capital.com mislukt ({e}); terugval op Yahoo")
+    return fetch_yahoo(symbol)
 
 def near_news(ts):
     for d, h, m in NEWS:
@@ -126,30 +190,45 @@ def push(topic, title, msg, priority="high"):
     urllib.request.urlopen(req, timeout=20).read()
 
 def scan(sent, topic, dry=False, replay_bars=0):
-    found = []
-    cache = {}
+    found = []; cache = {}
+    now = pd.Timestamp.now(tz=TZ)
     for name, mkt, fn in STRATS:
         try:
             if mkt not in cache: cache[mkt] = prep(fetch(MARKETS[mkt]["symbol"]))
-        except (urllib.error.URLError, KeyError, TimeoutError, ValueError) as e:
+        except (urllib.error.URLError, KeyError, TimeoutError, ValueError, IndexError) as e:
             print(f"[{time.strftime('%H:%M:%S')}] data {mkt} mislukt: {e}"); continue
         b = cache[mkt]; sig = fn(b)
-        idx = range(len(b) - max(1, replay_bars), len(b))
+        partial = b.index[-1] + pd.Timedelta(minutes=5) > now          # laatste bar nog niet afgesloten?
+        last_done = len(b) - 2 if partial else len(b) - 1
+        idx = range(last_done - max(1, replay_bars) + 1, last_done + 1) if replay_bars else [last_done]
         for i in idx:
-            s = int(sig.iloc[i]); ts = b.index[i]
-            if s == 0 or not (E0 <= b.t.iloc[i] < E1) or np.isnan(b.atr.iloc[i]): continue
-            key = f"{name}|{ts.isoformat()}"
-            day_key = f"{name}|{b.date.iloc[i]}"
+            s_ = int(sig.iloc[i]); ts = b.index[i]
+            if s_ == 0 or not (E0 <= b.t.iloc[i] < E1) or np.isnan(b.atr.iloc[i]): continue
+            key = f"{name}|{ts.isoformat()}"; day_key = f"{name}|{b.date.iloc[i]}"
             if replay_bars == 0:
                 if key in sent: continue
-                if (pd.Timestamp.now(tz=TZ) - ts) > pd.Timedelta(minutes=25): continue   # te oud, niet meer instappen
+                if (now - ts) > pd.Timedelta(minutes=45): continue          # te oud, niet meer instappen
                 if sent.get(day_key, 0) >= MAX_TRADES: continue
                 if near_news(ts): sent[key] = 1; continue
-            title, msg = alert_text(name, mkt, s, b.close.iloc[i], b.atr.iloc[i])
+            title, msg = alert_text(name, mkt, s_, b.close.iloc[i], b.atr.iloc[i])
             found.append((ts, title, msg))
             if replay_bars == 0:
                 sent[key] = 1; sent[day_key] = sent.get(day_key, 0) + 1
                 if not dry: push(topic, title, msg)
+        # voorsignaal: de bar die nu loopt zou bij sluiten op de huidige prijs een signaal geven
+        if partial and replay_bars == 0:
+            i = len(b) - 1; s_ = int(sig.iloc[i]); ts = b.index[i]
+            pkey = f"pre|{name}|{ts.isoformat()}"
+            if s_ != 0 and E0 <= b.t.iloc[i] < E1 and not np.isnan(b.atr.iloc[i]) and pkey not in sent and not near_news(ts) \
+               and f"{name}|{ts.isoformat()}" not in sent and sent.get(f"{name}|{b.date.iloc[i]}", 0) < MAX_TRADES:
+                sent[pkey] = 1
+                close_at = (ts + pd.Timedelta(minutes=5)).strftime("%H:%M")
+                title, msg = alert_text(name, mkt, s_, b.close.iloc[i], b.atr.iloc[i])
+                found.append((ts, "VOORSIGNAAL " + title, msg))
+                if not dry:
+                    push(topic, "VOORSIGNAAL " + title,
+                         f"Maak je klaar. Het signaal is pas definitief als de 5-minuten-bar van {close_at} zo sluit; je krijgt dan nog een melding. Nu: " + msg,
+                         priority="default")
     return found
 
 def main():
@@ -157,7 +236,8 @@ def main():
     ap.add_argument("--topic", required=True, help="geheime ntfy-kanaalnaam, kies zelf een lange willekeurige naam")
     ap.add_argument("--test", action="store_true", help="stuur een testmelding en toon de signalen van de laatste ~2 dagen")
     ap.add_argument("--once", action="store_true", help="een keer controleren en stoppen (voor GitHub Actions)")
-    ap.add_argument("--every", type=int, default=60, help="seconden tussen controles (standaard 60)")
+    ap.add_argument("--loop", type=int, default=0, help="blijf zoveel seconden elke --every seconden controleren (voor GitHub Actions)")
+    ap.add_argument("--every", type=int, default=20, help="seconden tussen controles (standaard 20)")
     a = ap.parse_args()
     state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alerts_sent.json")
     sent = json.load(open(state_file)) if os.path.exists(state_file) else {}
@@ -167,11 +247,14 @@ def main():
         for ts, title, msg in sorted(scan(sent, a.topic, dry=True, replay_bars=576)):
             print(" ", ts.strftime("%a %d-%m %H:%M"), title, "|", msg)
         return
-    if a.once:
-        for ts, title, msg in scan(sent, a.topic):
-            print(f"{title} | {msg}")
-        json.dump(sent, open(state_file, "w"))
-        return
+    if a.once or a.loop:
+        t_end = time.time() + a.loop
+        while True:
+            for ts, title, msg in scan(sent, a.topic):
+                print(f"{title} | {msg}", flush=True)
+            json.dump(sent, open(state_file, "w"))
+            if a.once or time.time() + a.every >= t_end: return
+            time.sleep(a.every)
     print("lucid_alerts draait. Stoppen met Ctrl+C. Laat dit venster open en je computer aan.")
     while True:
         for ts, title, msg in scan(sent, a.topic):
